@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"fmt"
 	"unsafe"
 )
 
@@ -13,7 +14,7 @@ import "C"
 type LegacyConsumer struct {
 	rk        *C.rd_kafka_t
 	rkt       *C.rd_kafka_topic_t
-	partition int
+	partition int32
 	topic     string
 }
 
@@ -22,44 +23,52 @@ func (c *LegacyConsumer) String() string {
 	return "LegacyConsumer"
 }
 
-func (c *LegacyConsumer) Close() {
+func (c *LegacyConsumer) Close() error {
 	if c.rkt != nil {
 		C.rd_kafka_consumer_close(c.rk)
 	}
 	C.rd_kafka_destroy(c.rk)
+	return nil
 }
 
-func (c *LegacyConsumer) OffsetsForTimes(times []TopicPartition, timeoutMs int) (offsets []TopicPartition, err error) {
-	cparts := newCPartsFromTopicPartitions(times)
-	defer C.rd_kafka_topic_partition_list_destroy(cparts)
-	cerr := C.rd_kafka_offsets_for_times(c.rk, cparts, C.int(timeoutMs))
-	if cerr != C.RD_KAFKA_RESP_ERR_NO_ERROR {
-		return nil, newError(cerr)
+func (c *LegacyConsumer) Unassign() error {
+	return nil
+}
+
+func (c *LegacyConsumer) Assign(topics []TopicPartition) error {
+	if len(topics) != 1 {
+		return fmt.Errorf("Only support one topic")
 	}
+	topic := topics[0]
+	err := c.consumeStart(topic.Topic, topic.Partition, topic.Offset)
+	if err != nil {
+		return err
+	}
+	c.topic = *topic.Topic
 
-	return newTopicPartitionsFromCparts(cparts), nil
+	return nil
 }
 
-func (c *LegacyConsumer) ConsumeStart(topic string, partition int, offset Offset) error {
+func (c *LegacyConsumer) consumeStart(topic *string, partition int32, offset Offset) error {
 	if c.rkt != nil {
 		return Error{ErrConflict, "consumer already started"}
 	}
 	c.partition = partition
-	c.topic = topic
+	c.topic = *topic
 
-	ctopic := C.CString(topic)
+	ctopic := C.CString(c.topic)
 	c.rkt = C.rd_kafka_topic_new(c.rk, ctopic, nil)
 	C.free(unsafe.Pointer(ctopic))
-	if C.rd_kafka_consume_start(c.rkt, C.int(partition), C.longlong(offset)) != 0 {
+	if C.rd_kafka_consume_start(c.rkt, C.int32_t(partition), C.int64_t(offset)) != 0 {
 		return newErrorFromString(ErrorCode(C.rd_kafka_last_error()), "rd_kafka_consume_start failed")
 	}
 
 	return nil
 }
 
-func (c *LegacyConsumer) ConsumeStop() {
+func (c *LegacyConsumer) consumeStop() {
 	if c.rkt != nil {
-		C.rd_kafka_consume_stop(c.rkt, C.int(c.partition))
+		C.rd_kafka_consume_stop(c.rkt, C.int32_t(c.partition))
 		C.rd_kafka_topic_destroy(c.rkt)
 		c.rkt = nil
 	}
@@ -70,7 +79,7 @@ func (c *LegacyConsumer) Poll(timeoutMs int) (event Event) {
 		return nil
 	}
 	C.rd_kafka_poll(c.rk, C.int(0))
-	cmsg := C.rd_kafka_consume(c.rkt, C.int(c.partition), C.int(timeoutMs))
+	cmsg := C.rd_kafka_consume(c.rkt, C.int32_t(c.partition), C.int(timeoutMs))
 	if cmsg != nil {
 		defer C.rd_kafka_message_destroy(cmsg)
 		return c.buildMessage(cmsg)
