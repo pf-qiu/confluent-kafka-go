@@ -101,7 +101,13 @@ func (c *LegacyConsumer) buildMessage(cmsg *C.rd_kafka_message_t) Event {
 		}
 		return msg
 	} else if cmsg.err == C.RD_KAFKA_RESP_ERR__PARTITION_EOF {
-		return &PartitionEOF{}
+
+		//crktpar := C.rd_kafka_event_topic_partition(rkev)
+		return PartitionEOF{
+			Topic:     &c.topic,
+			Partition: int32(cmsg.partition),
+			Offset:    Offset(cmsg.offset),
+		}
 	} else {
 		return newError(cmsg.err)
 	}
