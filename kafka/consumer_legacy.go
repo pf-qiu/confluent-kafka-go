@@ -15,15 +15,17 @@ typedef struct message_contiainer
 	size_t count;
 } message_contiainer;
 
-void init_container(message_contiainer* container, size_t count)
-{
-	container->count = count;
+message_contiainer* new_container(size_t count) {
+	message_contiainer* container = malloc(sizeof(message_contiainer));
 	container->msgs = malloc(sizeof(rd_kafka_message_t*) * count);
+	container->count = count;
+	return container;
 }
 
-void free_container_messages(message_contiainer* container)
-{
+void destroy_container(message_contiainer* container) {
 	free(container->msgs);
+	container->msgs = 0;
+	free(container);
 }
 
 ssize_t consume_messages(rd_kafka_topic_t *rkt, int32_t partition,
@@ -33,69 +35,52 @@ ssize_t consume_messages(rd_kafka_topic_t *rkt, int32_t partition,
 		container->msgs, container->count);
 }
 
-void destroy_messages(rd_kafka_message_t **msgs, ssize_t count)
+void destroy_messages(message_contiainer *container, ssize_t count)
 {
 	for (ssize_t i = 0; i < count; i++)
 	{
-		rd_kafka_message_destroy(msgs[i]);
+		rd_kafka_message_destroy(container->msgs[i]);
 	}
 }
 */
 import "C"
 
 type LegacyConsumer struct {
-	rk        *C.rd_kafka_t
-	rkt       *C.rd_kafka_topic_t
-	partition int32
-	topic     string
-	container C.message_contiainer
+	rk         *C.rd_kafka_t
+	rkt        *C.rd_kafka_topic_t
+	topic      string
+	batchSize  int
+	containers []*C.message_contiainer
 }
 
 // Strings returns a human readable name for a Consumer instance
 func (c *LegacyConsumer) String() string {
-	return "LegacyConsumer"
+	return fmt.Sprintf("LegacyConsumer(Topic: %s, BatchSize: %v, Partitions: %v)",
+		c.topic, c.batchSize, len(c.containers))
 }
 
 func (c *LegacyConsumer) Close() error {
 	if c.rkt != nil {
+		C.rd_kafka_topic_destroy(c.rkt)
 		C.rd_kafka_consumer_close(c.rk)
+		for i := 0; i < len(c.containers); i++ {
+			C.destroy_container(c.containers[i])
+			c.containers[i] = nil
+		}
 	}
 	C.rd_kafka_destroy(c.rk)
 
-	if c.container.count > 0 {
-		C.free_container_messages(&c.container)
+	return nil
+}
+
+func (c *LegacyConsumer) ConsumeStop(partition int32) error {
+	if C.rd_kafka_consume_stop(c.rkt, C.int32_t(partition)) != 0 {
+		return newErrorFromString(ErrorCode(C.rd_kafka_last_error()), "rd_kafka_consume_stop failed")
 	}
 	return nil
 }
 
-func (c *LegacyConsumer) Unassign() error {
-	return nil
-}
-
-func (c *LegacyConsumer) Assign(topics []TopicPartition) error {
-	if len(topics) != 1 {
-		return fmt.Errorf("Only support one topic")
-	}
-	topic := topics[0]
-	err := c.consumeStart(topic.Topic, topic.Partition, topic.Offset)
-	if err != nil {
-		return err
-	}
-	c.topic = *topic.Topic
-
-	return nil
-}
-
-func (c *LegacyConsumer) consumeStart(topic *string, partition int32, offset Offset) error {
-	if c.rkt != nil {
-		return Error{ErrConflict, "consumer already started"}
-	}
-	c.partition = partition
-	c.topic = *topic
-
-	ctopic := C.CString(c.topic)
-	c.rkt = C.rd_kafka_topic_new(c.rk, ctopic, nil)
-	C.free(unsafe.Pointer(ctopic))
+func (c *LegacyConsumer) ConsumeStart(partition int32, offset Offset) error {
 	if C.rd_kafka_consume_start(c.rkt, C.int32_t(partition), C.int64_t(offset)) != 0 {
 		return newErrorFromString(ErrorCode(C.rd_kafka_last_error()), "rd_kafka_consume_start failed")
 	}
@@ -103,20 +88,12 @@ func (c *LegacyConsumer) consumeStart(topic *string, partition int32, offset Off
 	return nil
 }
 
-func (c *LegacyConsumer) consumeStop() {
-	if c.rkt != nil {
-		C.rd_kafka_consume_stop(c.rkt, C.int32_t(c.partition))
-		C.rd_kafka_topic_destroy(c.rkt)
-		c.rkt = nil
-	}
-}
-
-func (c *LegacyConsumer) Poll(timeoutMs int) (event Event) {
+func (c *LegacyConsumer) Poll(timeoutMs int, partition int32) (event Event) {
 	if c.rkt == nil {
 		return nil
 	}
 	C.rd_kafka_poll(c.rk, C.int(0))
-	cmsg := C.rd_kafka_consume(c.rkt, C.int32_t(c.partition), C.int(timeoutMs))
+	cmsg := C.rd_kafka_consume(c.rkt, C.int32_t(partition), C.int(timeoutMs))
 	if cmsg != nil {
 		defer C.rd_kafka_message_destroy(cmsg)
 		return c.buildMessage(cmsg)
@@ -124,21 +101,26 @@ func (c *LegacyConsumer) Poll(timeoutMs int) (event Event) {
 	return nil
 }
 
-func (c *LegacyConsumer) PollBatch(timemoutMs int) []Event {
+func (c *LegacyConsumer) PollBatch(timemoutMs int, partition int32) []Event {
 	if c.rkt == nil {
 		return nil
 	}
 
-	if c.container.count <= 0 {
-		return nil
+	if int(partition) > len(c.containers) || partition < 0 {
+		return []Event{Error{
+			code: -1,
+			str:  "invalid partition",
+		}}
 	}
+
+	container := c.containers[partition]
 	C.rd_kafka_poll(c.rk, C.int(0))
 
-	count := C.consume_messages(c.rkt, C.int32_t(c.partition), C.int(timemoutMs), &c.container)
+	count := C.consume_messages(c.rkt, C.int32_t(partition), C.int(timemoutMs), container)
 	if count > 0 {
-		defer C.destroy_messages(c.container.msgs, count)
-		messages := c.getMessage(int(count))
+		defer C.destroy_messages(container, count)
 		events := make([]Event, count)
+		messages := c.getMessage(container.msgs, int(count))
 		for i := 0; i < int(count); i++ {
 			events[i] = c.buildMessage(messages[i])
 		}
@@ -147,8 +129,8 @@ func (c *LegacyConsumer) PollBatch(timemoutMs int) []Event {
 	return nil
 }
 
-func (c *LegacyConsumer) getMessage(count int) []*C.rd_kafka_message_t {
-	slice := (*[1 << 30]*C.rd_kafka_message_t)(unsafe.Pointer(c.container.msgs))[:count:count]
+func (c *LegacyConsumer) getMessage(msgs **C.rd_kafka_message_t, count int) []*C.rd_kafka_message_t {
+	slice := (*[1 << 30]*C.rd_kafka_message_t)(unsafe.Pointer(msgs))[:count:count]
 	return slice
 }
 
@@ -166,8 +148,6 @@ func (c *LegacyConsumer) buildMessage(cmsg *C.rd_kafka_message_t) Event {
 		}
 		return msg
 	} else if cmsg.err == C.RD_KAFKA_RESP_ERR__PARTITION_EOF {
-
-		//crktpar := C.rd_kafka_event_topic_partition(rkev)
 		return PartitionEOF{
 			Topic:     &c.topic,
 			Partition: int32(cmsg.partition),
@@ -178,7 +158,7 @@ func (c *LegacyConsumer) buildMessage(cmsg *C.rd_kafka_message_t) Event {
 	}
 }
 
-func NewLegacyConsumer(conf *ConfigMap) (*LegacyConsumer, error) {
+func NewLegacyConsumer(conf *ConfigMap, topic string) (*LegacyConsumer, error) {
 	err := versionCheck()
 	if err != nil {
 		return nil, err
@@ -199,17 +179,23 @@ func NewLegacyConsumer(conf *ConfigMap) (*LegacyConsumer, error) {
 	if c.rk == nil {
 		return nil, newErrorFromCString(C.RD_KAFKA_RESP_ERR__INVALID_ARG, cErrstr)
 	}
+
+	ctopic := C.CString(topic)
+	c.rkt = C.rd_kafka_topic_new(c.rk, ctopic, nil)
+	C.free(unsafe.Pointer(ctopic))
 
 	return c, nil
 }
 
-func NewLegacyBatchConsumer(conf *ConfigMap, batchSize int) (*LegacyConsumer, error) {
+func NewLegacyBatchConsumer(conf *ConfigMap, batchSize int, topic string, partitions int) (*LegacyConsumer, error) {
 	err := versionCheck()
 	if err != nil {
 		return nil, err
 	}
 
-	c := &LegacyConsumer{}
+	c := &LegacyConsumer{
+		topic: topic,
+	}
 
 	cConf, err := conf.convert()
 	if err != nil {
@@ -225,7 +211,15 @@ func NewLegacyBatchConsumer(conf *ConfigMap, batchSize int) (*LegacyConsumer, er
 		return nil, newErrorFromCString(C.RD_KAFKA_RESP_ERR__INVALID_ARG, cErrstr)
 	}
 
-	C.init_container(&c.container, C.size_t(batchSize))
+	c.batchSize = batchSize
+	c.containers = make([]*C.message_contiainer, partitions)
+	for i := 0; i < partitions; i++ {
+		c.containers[i] = C.new_container(C.ulong(c.batchSize))
+	}
+
+	ctopic := C.CString(topic)
+	c.rkt = C.rd_kafka_topic_new(c.rk, ctopic, nil)
+	C.free(unsafe.Pointer(ctopic))
 
 	return c, nil
 }
